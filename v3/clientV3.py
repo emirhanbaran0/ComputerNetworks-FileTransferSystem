@@ -19,6 +19,7 @@ PORT = 12346
 SECRET_KEY = b'\x01\x23\x45\x67\x89\xab\xcd\xef\x01\x23\x45\x67\x89\xab\xcd\xef'
 MTU = 1500
 PACKET_LOSS_PROB = 0.1
+MAX_RETRANSMISSIONS = 3 # New: Maximum number of retransmissions
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -52,7 +53,7 @@ def compute_ip_checksum(pkt):
     hdr_zero = hdr[:10] + b'\x00\x00' + hdr[12:]
     pkt.chksum = scapy_checksum(hdr_zero)
 
-def send_fragments(ip_id, pkt):
+def send_fragments(ip_id, pkt, packet_loss_prob): # Modified: accept packet_loss_prob
     """
     Fragment the packet, compute manual checksums, send each fragment,
     and return total bytes sent.
@@ -66,7 +67,7 @@ def send_fragments(ip_id, pkt):
     for f in frags:
         compute_ip_checksum(f)
         raw = bytes(f)
-        if random.random() < PACKET_LOSS_PROB:
+        if random.random() < packet_loss_prob: # Use dynamic packet_loss_prob
             logging.warning(f"[DROP] offset={f.frag*8}")
             continue
         send(f, verbose=False)
@@ -108,29 +109,53 @@ def main():
         send_prefixed(ctl, iv_b64)
         time.sleep(0.05)
 
-        # build & fragment
+        # Build packet once, re-use for retransmissions
         ip_id = random.randint(0, 0xFFFF)
-        pkt = IP(dst=HOST, id=ip_id, ttl=64, flags=0)/ICMP(type=8)/ct
+        pkt_to_send = IP(dst=HOST, id=ip_id, ttl=64, flags=0)/ICMP(type=8)/ct
 
-        # measure send bandwidth
-        t_send_start = time.time()
-        bytes_sent = send_fragments(ip_id, pkt)
-        t_send_end = time.time()
-        send_duration = t_send_end - t_send_start
-        if send_duration > 0:
-            mbps = (bytes_sent * 8) / (send_duration * 1e6)
-            logging.info(f"Sent {bytes_sent} B in {send_duration:.3f} s → {mbps:.2f} Mbps")
-        else:
-            logging.warning("Send duration too small to measure bandwidth")
+        retransmissions = 0
+        file_sent_successfully = False
 
-        # measure RTT
-        t0 = t_send_start  # or use t_send_end if you want RTT from end of send
-        resp = recv_prefixed(ctl)
-        if resp == b'DONE':
-            rtt_ms = (time.time() - t0)*1000
-            logging.info(f"Round-trip time: {rtt_ms:.1f} ms")
-        else:
-            logging.warning(f"Unexpected control message: {resp!r}")
+        while retransmissions <= MAX_RETRANSMISSIONS:
+            logging.info(f"Attempting to send file (Retransmission {retransmissions}/{MAX_RETRANSMISSIONS})")
+
+            # measure send bandwidth
+            t_send_start = time.time()
+            bytes_sent = send_fragments(ip_id, pkt_to_send, PACKET_LOSS_PROB) # Pass packet_loss_prob
+            t_send_end = time.time()
+            send_duration = t_send_end - t_send_start
+            if send_duration > 0:
+                mbps = (bytes_sent * 8) / (send_duration * 1e6)
+                logging.info(f"Sent {bytes_sent} B in {send_duration:.3f} s → {mbps:.2f} Mbps")
+            else:
+                logging.warning("Send duration too small to measure bandwidth")
+
+            # measure RTT
+            t0 = t_send_start
+            try:
+                resp = recv_prefixed(ctl)
+                if resp == b'DONE':
+                    rtt_ms = (time.time() - t0)*1000
+                    logging.info(f"Round-trip time: {rtt_ms:.1f} ms")
+                    logging.info("File transfer successful.")
+                    file_sent_successfully = True
+                    break # Exit retransmission loop
+                elif resp == b'INCOMPLETE':
+                    logging.warning(f"Server reported incomplete fragments. Retransmitting... (Attempt {retransmissions+1})")
+                    retransmissions += 1
+                    # Increment IP ID for retransmission to ensure server treats it as a new attempt
+                    ip_id = random.randint(0, 0xFFFF)
+                    pkt_to_send = IP(dst=HOST, id=ip_id, ttl=64, flags=0)/ICMP(type=8)/ct
+                    time.sleep(1) # Give server time to process and for network to clear
+                else:
+                    logging.warning(f"Unexpected control message: {resp!r}")
+                    break # Exit loop on unexpected message
+            except ConnectionError as e:
+                logging.error(f"Control connection error: {e}. Aborting retransmissions.")
+                break # Exit loop on connection error
+
+        if not file_sent_successfully:
+            logging.error(f"File transfer failed after {MAX_RETRANSMISSIONS} retransmissions.")
 
     ctl.close()
 

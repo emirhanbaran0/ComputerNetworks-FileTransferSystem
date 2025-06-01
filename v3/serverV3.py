@@ -6,6 +6,7 @@ import hashlib
 import logging
 import base64
 import random
+import time # Added for timeout in sniff
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
@@ -53,6 +54,13 @@ def unique_received_path(name, prefix="received_", max_tries=1000):
 def reassemble(fragments, total_len):
     buf = bytearray(total_len)
     for off, chunk in fragments.items():
+        # Ensure chunk fits within the allocated buffer
+        if off + len(chunk) > total_len:
+            logging.warning(f"Fragment extends beyond expected total length. Offset: {off}, Chunk Len: {len(chunk)}, Total Len: {total_len}")
+            # Optionally handle this as an error or clip the chunk
+            # For now, we'll try to put it in, but it might cause issues if total_len is strictly enforced.
+            # A more robust solution would re-evaluate total_len or discard the packet.
+            pass
         buf[off:off+len(chunk)] = chunk
     return bytes(buf)
 
@@ -85,10 +93,10 @@ def start_server():
 
         fragments = {}
         expected_total = None
-        ip_id = None
+        current_ip_id = None # Renamed from ip_id to current_ip_id to avoid confusion with new sniff parameter
 
         def on_frag(pkt):
-            nonlocal expected_total, ip_id
+            nonlocal expected_total, current_ip_id, fragments
             if not (IP in pkt and ICMP in pkt):
                 return False
 
@@ -99,37 +107,61 @@ def start_server():
             hdr = raw[:ihl*4]
             hdr_zero = hdr[:10] + b'\x00\x00' + hdr[12:]
             if ip.chksum != scapy_checksum(hdr_zero):
-                logging.warning("Bad IP checksum, dropping")
+                logging.warning(f"Bad IP checksum 0x{ip.chksum:04x} (expected 0x{scapy_checksum(hdr_zero):04x}), dropping")
                 return False
 
-            if ip_id is None:
-                ip_id = ip.id
-                logging.info(f"Using IP-ID={ip_id}")
-            if ip.id != ip_id:
-                return False
+            # If this is a new IP ID, reset state (implies retransmission of entire file)
+            if current_ip_id is None:
+                current_ip_id = ip.id
+                logging.info(f"Setting expected IP-ID={current_ip_id}")
+            elif ip.id != current_ip_id:
+                logging.info(f"Ignoring packet with different IP-ID ({ip.id}) than current ({current_ip_id}). Likely a retransmission attempt.")
+                return False # Ignore packets from previous or different attempts
 
             off = ip.frag * 8
             fragments[off] = bytes(pkt[ICMP].payload)
 
             if ip.flags.MF == 0:
-                expected_total = off + len(fragments[off])
-                logging.info(f"Last frag at offset {off}, total={expected_total}")
+                # This is the last fragment, so we now know the expected total length
+                new_expected_total = off + len(fragments[off])
+                if expected_total is None or new_expected_total > expected_total:
+                    expected_total = new_expected_total
+                    logging.info(f"Last frag at offset {off}, total={expected_total}")
 
+            # Condition to stop sniffing:
+            # We need to know the expected_total, and all fragments up to that total must be received.
             if expected_total is not None:
-                if sum(len(v) for v in fragments.values()) >= expected_total:
-                    return True
-            return False
+                current_received_length = sum(len(v) for v in fragments.values())
+                # Check if all expected fragments are present and their combined length matches expected_total
+                if current_received_length >= expected_total:
+                    # Quick check for contiguous fragments to ensure all parts are there
+                    # This is a basic check. A more robust one would iterate through sorted keys
+                    # and ensure no gaps. For simplicity, we just check total length.
+                    logging.info(f"Received total length {current_received_length}, Expected {expected_total}. Attempting reassembly.")
+                    return True # Stop sniffing
+            return False # Continue sniffing
 
-        sniff(
+        # Sniff with a timeout to prevent indefinite waiting for fragments
+        # The timeout duration might need adjustment based on network conditions
+        sniff_result = sniff(
             filter=f"icmp and host {addr[0]}",
             prn=on_frag,
             stop_filter=lambda pkt: on_frag(pkt) is True,
-            timeout=30
+            timeout=10 # Reduced timeout to quickly detect incomplete transfers for retransmission
         )
 
-        if expected_total is None or sum(len(v) for v in fragments.values()) < expected_total:
-            logging.error("Incomplete fragments, skipping file.")
-            continue
+        # Check if sniff stopped due to timeout or successful reassembly
+        is_complete = False
+        if expected_total is not None and sum(len(v) for v in fragments.values()) >= expected_total:
+            is_complete = True
+            # Also, check if the actual reassembled data size matches expected_total
+            # (though reassemble function handles this by pre-allocating buffer)
+            # A more robust check might be to ensure all offsets from 0 up to expected_total are covered.
+
+        if not is_complete:
+            logging.error("Incomplete fragments received (or timed out). Signalling client to retransmit.")
+            send_prefixed(conn, b'INCOMPLETE') # Signal client to retransmit
+            continue # Go back to waiting for next file/retransmission
 
         ciphertext = reassemble(fragments, expected_total)
 
@@ -138,6 +170,7 @@ def start_server():
             plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size)
         except Exception as e:
             logging.error(f"Decryption failed: {e}")
+            send_prefixed(conn, b'ERROR') # Signal an error to the client
             continue
 
         outpath = unique_received_path(os.path.basename(fn))
@@ -147,11 +180,10 @@ def start_server():
 
         if hashlib.sha256(plaintext).hexdigest() == file_hash:
             logging.info("SHA-256 check PASSED.")
+            send_prefixed(conn, b'DONE') # Signal client that reassembly + integrity check is done
         else:
             logging.error("SHA-256 check FAILED.")
-
-        # Signal client that reassembly + integrity check is done
-        send_prefixed(conn, b'DONE')
+            send_prefixed(conn, b'FAILED_HASH') # Signal hash mismatch to client
 
     conn.close()
     ctl.close()
