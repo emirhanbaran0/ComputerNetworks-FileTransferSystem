@@ -1,4 +1,3 @@
-# client.py
 import socket
 import os
 import struct
@@ -19,7 +18,7 @@ PORT = 12346
 SECRET_KEY = b'\x01\x23\x45\x67\x89\xab\xcd\xef\x01\x23\x45\x67\x89\xab\xcd\xef'
 MTU = 1500
 PACKET_LOSS_PROB = 0.1
-MAX_RETRANSMISSIONS = 3 # New: Maximum number of retransmissions
+MAX_RETRANSMISSIONS = 3 # Maximum number of retransmissions
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
